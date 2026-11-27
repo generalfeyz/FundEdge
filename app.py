@@ -5,10 +5,10 @@ FundEdge - USD macro-event dashboard for NAS100 and XAUUSD
 The fundamental companion to StatEdge. It answers three questions before you
 take a technical setup in your execution window:
 
-  1. What US news is out today and this week, in Lagos time?
-  2. Am I inside a news "Danger Zone" right now (30 min before/after a
-     high-impact USD release)?
-  3. After a top-tier release (CPI, NFP, GDP, FOMC), did the number come in
+1. What US news is out today and this week, in Lagos time?
+2. Am I inside a news "Danger Zone" right now (30 min before/after a
+     high-impact USD release) or a US market holiday / thin-liquidity session?
+3. After a top-tier release (CPI, NFP, GDP, FOMC), did the number come in
      hot or cool versus the forecast, and what bias does that imply?
 
 Run it with:   streamlit run app.py
@@ -19,14 +19,14 @@ Forex Factory's public weekly export:
     https://nfs.faireconomy.media/ff_calendar_thisweek.xml
 
 Three facts about that feed shape this code:
-  * It carries NO "Actual" values - only forecast and previous. The parser
+- It carries NO "Actual" values - only forecast and previous. The parser
     still reads an <actual> tag if one ever appears, but in practice you type
     the actual number into the Impact Analyzer after the release.
-  * Its <date>/<time> fields carry no time-zone label. Indicator code written
+- Its <date>/<time> fields carry no time-zone label. Indicator code written
     for it treats the times as GMT. Instead of trusting either assumption, the
     app checks the clock from the data itself (US releases cluster at 8:30 and
     10:00 New York time) and shows you the evidence in the "Feed status" tab.
-  * Forex Factory allows about 2 downloads per 5 minutes per file and updates
+- Forex Factory allows about 2 downloads per 5 minutes per file and updates
     the file roughly hourly. The app keeps the last good copy on disk and
     downloads at most once every 15 minutes.
 
@@ -47,8 +47,10 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import os
 import re
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -75,6 +77,20 @@ MANUAL_ACTUALS = DATA_DIR / "manual_actuals.json"
 REFRESH_EVERY_S = 15 * 60   # normal re-download interval (feed changes ~hourly)
 MIN_GAP_S = 150             # hard floor between downloads: stays under 2 per 5 min
 HTTP_TIMEOUT = (10, 20)     # (connect, read) seconds
+
+# Saving files: OneDrive, antivirus or a second browser tab can lock a file for
+# a moment. Retry the final swap a few times before giving up on the save.
+REPLACE_ATTEMPTS = 5
+REPLACE_RETRY_S = 0.2
+
+# Warnings go to the black console window that runs the app.
+log = logging.getLogger("fundedge")
+if not log.handlers:                      # the script re-runs; add the handler once
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s FundEdge %(levelname)s: %(message)s"))
+    log.addHandler(_handler)
+    log.setLevel(logging.INFO)
+    log.propagate = False
 HTTP_HEADERS = {
     "User-Agent": "FundEdge/1.0 (personal macro dashboard; polite 15-min cache)",
     "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.5",
@@ -89,12 +105,12 @@ CURRENCY = "USD"            # NAS100 and XAUUSD are both priced off USD news
 DANGER_MINUTES = 30         # blackout before AND after each high-impact release
 
 # Your execution window. Two ways to define it (switch in the sidebar):
-#   "ny"    - 9:30-11:00 New York time. Equals 3:30-5:00 PM WAT while the US
-#             is on winter time (EST), and 2:30-4:00 PM WAT from 14 Mar 2027
+#   "ny"    - 9:30-11:30 New York time. Equals 3:30-5:30 PM WAT while the US
+#             is on winter time (EST), and 2:30-4:30 PM WAT from 14 Mar 2027
 #             when the US moves to EDT. Follows the real NY open.
-#   "lagos" - fixed 3:30-5:00 PM WAT all year, exactly as you specified.
-EXEC_WINDOW_NY = ((9, 30), (11, 0))
-EXEC_WINDOW_LAGOS = ((15, 30), (17, 0))
+#   "lagos" - fixed 3:30-5:30 PM WAT all year, exactly as you specified.
+EXEC_WINDOW_NY = ((9, 30), (11, 30))
+EXEC_WINDOW_LAGOS = ((15, 30), (17, 30))
 
 IMPACT_ORDER = ["High", "Medium", "Low", "Holiday"]
 IMPACT_STYLE = {
@@ -103,6 +119,36 @@ IMPACT_STYLE = {
     "Medium":  ("#f76b15", "#ffffff", "MED"),
     "Low":     ("#ffd60a", "#111111", "LOW"),
     "Holiday": ("#6b7280", "#ffffff", "HOLIDAY"),
+}
+
+# NYSE / Nasdaq Full Closures & Early Closes (2026-2028)
+US_MARKET_HOLIDAYS = {
+    date(2026, 11, 26): ("CLOSED", "US Thanksgiving — NYSE/Nasdaq closed. Skip or cut risk."),
+    date(2026, 11, 27): ("EARLY CLOSE", "Black Friday — US markets close at 1:00 PM ET (7:00 PM WAT). Thin liquidity."),
+    date(2026, 12, 24): ("EARLY CLOSE", "Christmas Eve — US markets close at 1:00 PM ET (7:00 PM WAT)."),
+    date(2026, 12, 25): ("CLOSED", "Christmas Day — Global markets closed."),
+    date(2027, 1, 1):   ("CLOSED", "New Year's Day — Global markets closed. Normal volume returns Jan 4."),
+    date(2027, 1, 18):  ("CLOSED", "MLK Jr. Day — US equities & banks closed."),
+    date(2027, 2, 15):  ("CLOSED", "Presidents' Day — US equities & banks closed."),
+    date(2027, 3, 26):  ("CLOSED", "Good Friday — US & major global markets closed."),
+    date(2027, 5, 31):  ("CLOSED", "Memorial Day — US equities & banks closed."),
+    date(2027, 6, 18):  ("CLOSED", "Juneteenth (Observed) — US equities & banks closed."),
+    date(2027, 7, 5):   ("CLOSED", "Independence Day (Observed) — US equities & banks closed."),
+    date(2027, 9, 6):   ("CLOSED", "Labor Day — US equities & banks closed."),
+    date(2027, 11, 25): ("CLOSED", "US Thanksgiving — NYSE/Nasdaq closed."),
+    date(2027, 11, 26): ("EARLY CLOSE", "Black Friday — US markets close at 1:00 PM ET (7:00 PM WAT). Thin liquidity."),
+    date(2027, 12, 24): ("CLOSED", "Christmas Day (Observed) — US equities & banks closed."),
+    date(2028, 1, 17):  ("CLOSED", "MLK Jr. Day — US equities & banks closed."),
+    date(2028, 2, 21):  ("CLOSED", "Presidents' Day — US equities & banks closed."),
+    date(2028, 4, 14):  ("CLOSED", "Good Friday — US & major global markets closed."),
+    date(2028, 5, 29):  ("CLOSED", "Memorial Day — US equities & banks closed."),
+    date(2028, 6, 19):  ("CLOSED", "Juneteenth — US equities & banks closed."),
+    date(2028, 7, 3):   ("EARLY CLOSE", "Independence Day Eve — US markets close at 1:00 PM ET (6:00 PM WAT). Thin liquidity."),
+    date(2028, 7, 4):   ("CLOSED", "Independence Day — US equities & banks closed."),
+    date(2028, 9, 4):   ("CLOSED", "Labor Day — US equities & banks closed."),
+    date(2028, 11, 23): ("CLOSED", "US Thanksgiving — NYSE/Nasdaq closed."),
+    date(2028, 11, 24): ("EARLY CLOSE", "Black Friday — US markets close at 1:00 PM ET (7:00 PM WAT). Thin liquidity."),
+    date(2028, 12, 25): ("CLOSED", "Christmas Day — Global markets closed."),
 }
 
 # -----------------------------------------------------------------------------
@@ -194,12 +240,66 @@ def _read_json(path: Path, default):
         return default
 
 
-def _write_atomic(path: Path, data: bytes) -> None:
-    """Write to a temp file, then swap it in, so a crash never leaves half a file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+def _read_bytes(path: Path) -> bytes | None:
+    """File contents, or None if it is missing or locked right now."""
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+@st.cache_resource
+def _memory() -> dict:
+    """
+    One in-memory store shared by every tab and rerun of this running app.
+    Holds the latest feed and anything that could not be written to disk,
+    so a locked file never loses data while the app is open.
+    """
+    return {}
+
+
+def _write_atomic(path: Path, data: bytes) -> bool:
+    """
+    Save `data` to `path` without ever leaving a half-written file.
+    Returns True if saved, False if not. Never raises.
+
+1. Write to a temp file with a unique name in the same folder, so two
+         reruns or two tabs saving at the same moment never share a temp file.
+2. Swap it into place with os.replace. On Windows that fails with
+         PermissionError while OneDrive (or another tab reading the file)
+         holds a lock, so retry up to REPLACE_ATTEMPTS times, REPLACE_RETRY_S apart.
+3. If it still fails, log a warning, delete the temp file and return
+         False; the caller keeps the data in memory instead of crashing.
+    """
+    tmp_name = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        for attempt in range(1, REPLACE_ATTEMPTS + 1):
+            try:
+                os.replace(tmp_name, path)
+                if attempt > 1:
+                    log.info("Saved %s on attempt %d (file was briefly locked).", path.name, attempt)
+                return True
+            except PermissionError as exc:
+                if attempt == REPLACE_ATTEMPTS:
+                    log.warning("Could not save %s after %d attempts: %s. "
+                                "Keeping it in memory instead.", path.name, attempt, exc)
+                else:
+                    time.sleep(REPLACE_RETRY_S)
+    except OSError as exc:          # disk full, folder not writable, temp file blocked...
+        log.warning("Could not save %s: %s. Keeping it in memory instead.", path.name, exc)
+    finally:
+        if tmp_name and os.path.exists(tmp_name):
+            try:
+                os.remove(tmp_name)
+            except OSError:
+                pass                # a leftover .tmp file is harmless
+    return False
 
 
 def _looks_like_feed(raw: bytes) -> bool:
@@ -213,9 +313,9 @@ def get_feed(force: bool = False) -> tuple[bytes | None, dict]:
     Return (xml_bytes, status).
 
     Rules:
-      * use the disk copy if it is younger than REFRESH_EVERY_S;
-      * otherwise download, but never twice within MIN_GAP_S;
-      * if the download fails or Forex Factory rate-limits us, fall back to the
+- use the disk copy if it is younger than REFRESH_EVERY_S;
+- otherwise download, but never twice within MIN_GAP_S;
+- if the download fails or Forex Factory rate-limits us, fall back to the
         last good copy and say so in status["message"].
     """
     # Testing / offline switch: read a local file and never touch the network.
@@ -226,10 +326,17 @@ def get_feed(force: bool = False) -> tuple[bytes | None, dict]:
                      "fetched_at": None, "stale": False}
 
     meta = _read_json(FEED_META, {})
-    cached = FEED_CACHE.read_bytes() if FEED_CACHE.exists() else None
+    mem = _memory()
     t = time.time()
-    last_ok = float(meta.get("last_success_epoch", 0))
-    last_try = float(meta.get("last_attempt_epoch", 0))
+    # Newest copy wins: the disk cache, or one held in memory because the
+    # disk save failed (file locked).
+    cached = _read_bytes(FEED_CACHE)
+    last_ok = float(meta.get("last_success_epoch", 0)) if cached is not None else 0.0
+    if mem.get("feed") is not None and mem.get("feed_epoch", 0) > last_ok:
+        cached, last_ok = mem["feed"], mem["feed_epoch"]
+    # Throttle on whichever attempt time is later, so a failed meta save can
+    # never make the app hit Forex Factory on every rerun.
+    last_try = max(float(meta.get("last_attempt_epoch", 0)), mem.get("last_attempt", 0.0))
     fetched_at = datetime.fromtimestamp(last_ok, UTC) if last_ok else None
 
     due = cached is None or force or (t - last_ok) >= REFRESH_EVERY_S
@@ -247,17 +354,26 @@ def get_feed(force: bool = False) -> tuple[bytes | None, dict]:
                         "message": msg}
 
     meta["last_attempt_epoch"] = t
+    mem["last_attempt"] = t
     reason = ""
     try:
         r = requests.get(FEED_URL, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
         body = r.content
         if r.status_code == 200 and _looks_like_feed(body):
             parse_feed(body)                      # refuse to cache a broken file
-            _write_atomic(FEED_CACHE, body)
-            meta.update(last_success_epoch=t, last_error="")
+            mem["feed"], mem["feed_epoch"] = body, t
+            saved = _write_atomic(FEED_CACHE, body)
+            if saved:
+                meta.update(last_success_epoch=t, last_error="")
+            else:
+                meta["last_error"] = "feed downloaded but the disk copy was locked; held in memory"
             _write_atomic(FEED_META, json.dumps(meta).encode())
+            msg = "Downloaded just now from Forex Factory."
+            if not saved:
+                msg += (" Couldn't save a copy to disk (the file was locked, usually by OneDrive "
+                        "or another open tab), so it is held in memory until the next refresh.")
             return body, {"source": "live", "fetched_at": datetime.fromtimestamp(t, UTC),
-                          "stale": False, "message": "Downloaded just now from Forex Factory."}
+                          "stale": False, "message": msg}
         if b"request denied" in body.lower() or r.status_code == 429:
             reason = "Forex Factory rate limit hit ('Request Denied')"
         else:
@@ -448,7 +564,7 @@ def exec_window(day: date, anchor: str) -> tuple[datetime, datetime]:
 
 
 # =============================================================================
-# 5. DANGER ZONE LOGIC
+# 5. DANGER ZONE & HOLIDAY LOGIC
 # =============================================================================
 
 def danger_events(events: list[Event], now: datetime,
@@ -490,6 +606,49 @@ def blackouts_in_window(events: list[Event], day: date, anchor: str):
             rows.append({"event": e, "start": b0, "end": b1,
                          "overlap": (o0, o1) if o0 < o1 else None})
     return rows
+
+
+def first_trading_day_of_january(year: int) -> date:
+    """First Monday-to-Friday date from Jan 2 onward that is not CLOSED in US_MARKET_HOLIDAYS."""
+    d = date(year, 1, 2)
+    while d.weekday() >= 5 or US_MARKET_HOLIDAYS.get(d, (None,))[0] == "CLOSED":
+        d += timedelta(days=1)
+    return d
+
+
+def render_holiday_guard(today: date) -> None:
+    """Display US market holiday closures, early closes, year-end chop, and 5-day heads-up."""
+    if today in US_MARKET_HOLIDAYS:
+        status, msg = US_MARKET_HOLIDAYS[today]
+        if status == "CLOSED":
+            st.error(f"🏦 US MARKET HOLIDAY ({status}): {msg}")
+        else:
+            st.warning(f"⏰ US MARKET {status}: {msg}")
+    elif (today.month == 12 and today.day >= 24) or (
+        today.month == 1 and today < first_trading_day_of_january(today.year)
+    ):
+        return_day = first_trading_day_of_january(
+            today.year + 1 if today.month == 12 else today.year
+        )
+        st.warning(
+            f"🎄 YEAR-END THIN LIQUIDITY: Wider spreads and holiday chop expected until "
+            f"{return_day.strftime('%b')} {return_day.day}. Trade half-risk or stand aside."
+        )
+
+    upcoming = [
+        (d, status, msg)
+        for d, (status, msg) in sorted(US_MARKET_HOLIDAYS.items())
+        if today < d <= today + timedelta(days=5)
+    ]
+    for d, status, msg in upcoming:
+        st.info(f"📅 Upcoming US Holiday ({d.strftime('%a, %b %d')} — {status}): {msg}")
+
+    last_holiday = max(US_MARKET_HOLIDAYS)
+    if today >= last_holiday - timedelta(days=60):
+        st.caption(
+            f"⚠️ US market holiday table ends on {last_holiday.strftime('%b')} {last_holiday.day}, "
+            f"{last_holiday.year} — update US_MARKET_HOLIDAYS in app.py."
+        )
 
 
 # =============================================================================
@@ -583,16 +742,31 @@ def group_verdict(statuses: list[str]) -> str:
 
 
 def load_manual_actuals() -> dict:
-    return _read_json(MANUAL_ACTUALS, {})
+    """Saved actuals from disk, plus any typed while the file was locked."""
+    data = _read_json(MANUAL_ACTUALS, {})
+    for key, entry in _memory().get("manual_unsaved", {}).items():
+        if entry is None:
+            data.pop(key, None)
+        else:
+            data[key] = entry
+    return data
 
 
-def save_manual_actual(key: str, value: str) -> None:
+def save_manual_actual(key: str, value: str) -> bool:
+    """Save one typed actual. If the file is locked, keep it in memory and
+    write it with the next successful save. Returns True if it reached disk."""
     data = load_manual_actuals()
-    if value.strip():
-        data[key] = {"actual": value.strip(), "saved_utc": now_utc().isoformat()}
-    else:
+    entry = {"actual": value.strip(), "saved_utc": now_utc().isoformat()} if value.strip() else None
+    if entry is None:
         data.pop(key, None)
-    _write_atomic(MANUAL_ACTUALS, json.dumps(data, indent=1).encode())
+    else:
+        data[key] = entry
+    unsaved = _memory().setdefault("manual_unsaved", {})
+    if _write_atomic(MANUAL_ACTUALS, json.dumps(data, indent=1).encode()):
+        unsaved.clear()            # the file now holds every earlier unsaved entry too
+        return True
+    unsaved[key] = entry
+    return False
 
 
 def actual_for(e: Event, manual: dict) -> tuple[str, str]:
@@ -768,7 +942,7 @@ def timeline_html(day: date, events: list[Event], now: datetime, anchor: str) ->
 
 @st.fragment(run_every="30s")
 def live_header(events: list[Event], anchor: str) -> None:
-    """Clock tiles + Danger Zone banner. Re-runs by itself every 30 seconds."""
+    """Clock tiles + Holiday Guard + Danger Zone banner. Re-runs every 30 seconds."""
     now = now_utc()
     lagos_now = now.astimezone(LAGOS)
     today = lagos_now.date()
@@ -782,6 +956,8 @@ def live_header(events: list[Event], anchor: str) -> None:
         win_state, win_sub = "Closed for today", "reopens next trading day"
     if today.weekday() >= 5:
         win_state, win_sub = "Weekend", "US markets closed"
+    elif today in US_MARKET_HOLIDAYS and US_MARKET_HOLIDAYS[today][0] == "CLOSED":
+        win_state, win_sub = "Holiday", "US markets closed"
 
     nxt = next_high_event(events, now)
     nxt_v = (f"{fmt_clock(nxt.lagos)} WAT {nxt.lagos.strftime('%a')}" if nxt else "None left this week")
@@ -798,6 +974,8 @@ def live_header(events: list[Event], anchor: str) -> None:
         f"<div class='fe-tile'><div class='k'>{esc(k)}</div><div class='v'>{esc(v)}</div>"
         f"<div class='s'>{s if k.startswith('Next') else esc(s)}</div></div>"
         for k, v, s in tiles) + "</div>", unsafe_allow_html=True)
+
+    render_holiday_guard(today)
 
     hits = danger_events(events, now)
     if hits:
@@ -852,7 +1030,7 @@ STATUS_LABEL = {
 def _on_actual_change(state_key: str, event_key: str) -> None:
     """Save a typed actual and copy it to the same box on the other tab."""
     value = st.session_state.get(state_key, "")
-    save_manual_actual(event_key, value)
+    save_manual_actual(event_key, value)      # if the file is locked it is kept in memory
     for prefix in ("today_", "an_"):
         st.session_state[f"{prefix}act_{event_key}"] = value
 
@@ -931,12 +1109,12 @@ def main() -> None:
                  "the data itself; see the 'Feed status' tab for the evidence.")
         anchor_choice = st.radio(
             "Execution window follows",
-            ["New York open (9:30–11:00 ET)", "Fixed Lagos clock (3:30–5:00 PM WAT)"],
-            help="Both are 3:30–5:00 PM WAT while the US is on winter time. From 14 Mar 2027 "
-                 "the NY open moves to 2:30 PM WAT; the first option moves with it.")
+            ["New York open (9:30–11:30 ET)", "Fixed Lagos clock (3:30–5:30 PM WAT)"],
+            help="The New York option is 3:30–5:30 PM WAT in US winter (EST) and 2:30–4:30 PM WAT "
+                 "from 14 Mar 2027 (EDT); the second option stays fixed at 3:30–5:30 PM WAT.")
         anchor = "ny" if anchor_choice.startswith("New York") else "lagos"
         week_impacts = st.multiselect("This week: show impact levels", IMPACT_ORDER,
-                                      default=["High", "Medium", "Low"])
+                                      default=["High", "Medium", "Low", "Holiday"])
         force = st.button("🔄 Refresh feed now",
                           help="Downloads again if the last download was over 2.5 minutes ago.")
         uploaded = st.file_uploader("Or load the XML file yourself", type=["xml"],
@@ -972,6 +1150,10 @@ def main() -> None:
 
     if status.get("stale"):
         st.warning(status["message"])
+    if _memory().get("manual_unsaved"):
+        st.warning("Some actuals you typed couldn't be saved to disk yet (the file was locked, "
+                   "usually by OneDrive or another open tab). They are kept while the app runs "
+                   "and will be written with your next successful save.")
     if clock_choice != "Auto-detect (recommended)" and clock != detection["clock"] \
             and detection["confidence"] == "high":
         st.warning(f"You forced the feed clock to {FEED_CLOCKS[clock]}, but the data points "
